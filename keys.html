@@ -44,7 +44,10 @@
     border-radius:8px;padding:7px 12px;font-size:14px;font-family:inherit;cursor:pointer;min-height:36px;
   }
   button.primary{background:var(--accent);color:#06202c;border-color:var(--accent);font-weight:600}
+  button.rec{background:#b0353a;border-color:#c9464b;color:#fff;font-weight:600}
   button:disabled{opacity:.4;cursor:default}
+  select{background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:7px;font:inherit;max-width:220px}
+  label.fld{display:inline-flex;align-items:center;gap:5px;color:var(--dim);font-size:13px}
   label.chk{display:inline-flex;align-items:center;gap:5px;color:var(--dim);font-size:13px;cursor:pointer}
   input[type=checkbox]{width:16px;height:16px;accent-color:var(--accent)}
   .stat{font-size:13px;color:var(--dim)}
@@ -89,6 +92,15 @@
   <label class="chk"><input type="checkbox" id="optVel" checked>ベロシティ</label>
   <label class="chk"><input type="checkbox" id="optPed" checked>ペダル</label>
   <label class="chk"><input type="checkbox" id="optClear">背景を透明に</label>
+  <button id="btnRec" class="rec">● 録音開始</button>
+  <span id="recStat" class="stat"></span>
+  <label class="fld">演奏 <select id="takeSel" aria-label="演奏の一覧"></select></label>
+  <button id="btnPlay">▶ 再生</button>
+  <label class="fld">出力 <select id="outSel" aria-label="再生の出力先"></select></label>
+  <button id="btnMid">.mid 保存</button>
+  <button id="btnImport">.mid 読み込み</button>
+  <input id="midFile" type="file" accept=".mid,.midi,audio/midi" hidden>
+  <span id="playStat" class="stat"></span>
   <span class="sp"></span>
   <span class="tip">配信ソフトに入れるときは <code>keys.html?clear=1&amp;bar=0</code> のように付けると、透明背景でこのバーごと消せます</span>
 </div>
@@ -122,6 +134,7 @@ const S={
   seenCC:{64:true,66:false,67:false},
   showVel:true, showPed:true, clear:false,
   flow:false, flowSec:3.0,      /* 流れる表示と、上まで流れきる時間（秒） */
+  recording:false, recT0:0, events:[], takes:[], curId:null,
 };
 const damperDown = () => S.cc[64]>=64;
 const sounding = () => { const s=new Set(S.held.keys()); for(const n of S.pedHeld) s.add(n); return s; };
@@ -152,6 +165,7 @@ function attachMidi(ev){
   if(ev && ev.port && ev.port.state==='disconnected') panic();
   const names=[];
   for(const i of midi.inputs.values()){ i.onmidimessage=e=>handleMessage(e.data); names.push(i.name); }
+  refreshOutputs();
   if(!names.length) setStatus('入力デバイスが見つかりません','warn');
   else setStatus('接続済み：'+names.join(' / '),'ok');
 }
@@ -179,17 +193,18 @@ function noteOn(n,v){
   S.held.set(n,v); S.pedHeld.delete(n);
   S.vel.set(n, Math.max(prev,v));               /* 鳴っている間は大きいほうを残す */
   if(S.flow){ endRibbon(n); startRibbon(n,v,COL_ON); }   /* 弾き直しは帯を区切る */
-  syncRibbons(); render();
+  syncRibbons(); rec({k:'on',a:n,b:v}); render();
 }
 function noteOff(n){
   if(!S.held.has(n)) return;
   S.held.delete(n);
   if(damperDown()||S.sost.has(n)) S.pedHeld.add(n);
-  pruneVel(); syncRibbons(); render();
+  pruneVel(); syncRibbons(); rec({k:'off',a:n,b:0}); render();
 }
 function controlPedal(cc,v){
   const prev=S.cc[cc];
   S.cc[cc]=v; S.seenCC[cc]=true;
+  rec({k:'cc',a:cc,b:v});
   if(cc===64 && prev>=64 && v<64)
     for(const n of [...S.pedHeld]) if(!S.sost.has(n)) S.pedHeld.delete(n);
   if(cc===66){
@@ -200,6 +215,7 @@ function controlPedal(cc,v){
 }
 function panic(){
   S.held.clear(); S.pedHeld.clear(); S.sost.clear(); S.vel.clear();
+  S.cc={64:0,66:0,67:0};
   for(const r of ribbons) if(r.t1===null) r.t1=performance.now();
   live.clear();
   render();
@@ -387,6 +403,462 @@ function render(){
   kb.addEventListener('pointercancel',up);
 })();
 
+/* ===== 録音と保存 ===== */
+const curTake=()=>S.takes.find(t=>t.id===S.curId)||null;
+const fmtTime=ms=>{ const s=Math.max(0,ms)/1000, m=Math.floor(s/60); return `${m}:${(s-m*60).toFixed(1).padStart(4,'0')}`; };
+function rec(e){
+  if(S.recording&&!PB.playing) S.events.push({t:Math.round(performance.now()-S.recT0),...e});
+}
+function startRec(){
+  if(PB.playing) stopPlay();
+  S.recording=true; S.recT0=performance.now(); S.events=[];
+  for(const [n,v] of S.held) S.events.push({t:0,k:'on',a:n,b:v});
+  for(const cc of [64,66,67]) if(S.cc[cc]>0) S.events.push({t:0,k:'cc',a:cc,b:S.cc[cc]});
+  $('btnRec').textContent='■ 停止'; $('btnRec').classList.remove('rec');
+  tickRec();
+}
+let recTimer=null;
+function tickRec(){
+  clearTimeout(recTimer); if(!S.recording) return;
+  $('recStat').textContent=`録音中 ${fmtTime(performance.now()-S.recT0)}　イベント ${S.events.length}`;
+  $('recStat').className='stat warn'; recTimer=setTimeout(tickRec,200);
+}
+function stopRec(){
+  S.recording=false; clearTimeout(recTimer);
+  $('btnRec').textContent='● 録音開始'; $('btnRec').classList.add('rec');
+  const ev=S.events, dur=Math.round(performance.now()-S.recT0), open=new Set();
+  for(const e of ev){ if(e.k==='on') open.add(e.a); else if(e.k==='off') open.delete(e.a); }
+  for(const n of open) ev.push({t:dur,k:'off',a:n,b:0});
+  ev.sort((a,b)=>a.t-b.t);
+  if(!ev.length){ $('recStat').textContent='何も記録されませんでした'; $('recStat').className='stat'; return; }
+  const at=Date.now(), d=new Date(at), p=n=>String(n).padStart(2,'0');
+  const take={id:'t'+at+'-'+Math.random().toString(36).slice(2,8),at,
+    name:`${d.getMonth()+1}/${d.getDate()} ${p(d.getHours())}:${p(d.getMinutes())}`,dur,events:ev};
+  S.takes.unshift(take); S.curId=take.id;
+  saveTakes(); refreshTakes();
+  $('recStat').textContent='録音しました'; $('recStat').className='stat ok';
+}
+const LS_TAKES='pm.v1.takes';
+function saveTakes(){
+  const takes=[...S.takes];
+  while(takes.length){
+    try{ localStorage.setItem(LS_TAKES,JSON.stringify(takes)); return; }
+    catch(e){ takes.pop(); }
+  }
+  try{ localStorage.removeItem(LS_TAKES); }catch(e){}
+}
+function loadTakes(){
+  const previous=S.curId;
+  try{ const a=JSON.parse(localStorage.getItem(LS_TAKES)||'[]');
+    if(Array.isArray(a)) S.takes=a.filter(t=>t&&Array.isArray(t.events));
+  }catch(e){}
+  S.curId=S.takes.some(t=>t.id===previous)?previous:(S.takes[0]?.id||null);
+}
+function refreshTakes(){
+  $('takeSel').replaceChildren(...(S.takes.length
+    ? S.takes.map(t=>{ const o=new Option(t.name,t.id); o.selected=t.id===S.curId; return o; })
+    : [new Option('録音なし','')]));
+  $('btnPlay').disabled=$('btnMid').disabled=!curTake();
+}
+
+const LOOKAHEAD=250;                       /* ms。これだけ先まで送っておく */
+const PB={
+  playing:false, startAt:0, offset:0,      /* offset = 再生開始位置(ms) */
+  sendIdx:0, dispIdx:0, damper:0,
+  timer:null, raf:null, out:null,          /* out=null なら内蔵音 */
+  onNotes:new Set(),                       /* 消し忘れ防止に、鳴らした音を控える */
+  pos:0,
+};
+const pbElapsed = () => PB.offset + (performance.now()-PB.startAt);
+
+/* ---- 内蔵音 ------------------------------------------------------------
+   本命は「録音したピアノの音」を使うこと。Salamander Grand Piano
+   （Alexander Holm、CC-BY 3.0。ヤマハ C5 を録ったもの）を Tone.js の
+   配布先から、必要になったときだけ取りに行く。3半音おきに30音・約1.9MB。
+   一度読めば Cache API に残るので、次からは通信なしで鳴る。
+   取りに行けなかったときは、下の合成音に落ちる。 */
+const SF_BASE='https://tonejs.github.io/audio/salamander/';
+const SF_NOTES=[[21,'A0'],[24,'C1'],[27,'Ds1'],[30,'Fs1'],[33,'A1'],[36,'C2'],[39,'Ds2'],
+  [42,'Fs2'],[45,'A2'],[48,'C3'],[51,'Ds3'],[54,'Fs3'],[57,'A3'],[60,'C4'],[63,'Ds4'],
+  [66,'Fs4'],[69,'A4'],[72,'C5'],[75,'Ds5'],[78,'Fs5'],[81,'A5'],[84,'C6'],[87,'Ds6'],
+  [90,'Fs6'],[93,'A6'],[96,'C7'],[99,'Ds7'],[102,'Fs7'],[105,'A7'],[108,'C8']];
+const PIANO={state:'none', bufs:new Map(), notes:[]};   /* none / loading / ready / failed */
+
+/* 録音は最長20秒近くあり、そのまま持つとメモリを食う。モノラルにして、
+   音の高さに応じた長さで切る（末尾は短くフェード）。 */
+function trimMono(c, buf, f){
+  const maxDur=clamp(1.5+700/f, 1.5, 12);
+  const n=Math.min(buf.length, Math.floor(maxDur*buf.sampleRate));
+  const out=c.createBuffer(1, n, buf.sampleRate), d=out.getChannelData(0);
+  const L=buf.getChannelData(0), R=buf.numberOfChannels>1?buf.getChannelData(1):L;
+  for(let i=0;i<n;i++) d[i]=(L[i]+R[i])*0.5;
+  const fade=Math.min(2000,n);
+  for(let i=0;i<fade;i++) d[n-fade+i]*=1-i/fade;
+  return out;
+}
+async function loadPiano(onProgress){
+  if(PIANO.state==='ready') return true;
+  if(PIANO.state==='loading') return false;
+  PIANO.state='loading';
+  const c=ac();
+  let cache=null;
+  try{ cache=await caches.open('pm-salamander-v1'); }catch(e){}
+  let done=0;
+  await Promise.all(SF_NOTES.map(async ([n,name])=>{
+    const url=SF_BASE+name+'.mp3';
+    try{
+      let res=null;
+      if(cache) try{ res=await cache.match(url); }catch(e){}
+      if(!res){
+        res=await fetch(url);
+        if(!res.ok) throw new Error('HTTP '+res.status);
+        if(cache) try{ await cache.put(url,res.clone()); }catch(e){}
+      }
+      const raw=await c.decodeAudioData(await res.arrayBuffer());
+      PIANO.bufs.set(n, trimMono(c, raw, 440*Math.pow(2,(n-69)/12)));
+    }catch(e){}
+    if(onProgress) onProgress(++done, SF_NOTES.length);
+  }));
+  PIANO.notes=[...PIANO.bufs.keys()].sort((a,b)=>a-b);
+  PIANO.state = PIANO.bufs.size>=SF_NOTES.length-2 ? 'ready' : 'failed';
+  return PIANO.state==='ready';
+}
+/* いちばん近い録音を選ぶ。3半音おきなので、ずらすのは最大1半音 */
+function nearestSample(note){
+  let best=PIANO.notes[0];
+  for(const n of PIANO.notes) if(Math.abs(n-note)<Math.abs(best-note)) best=n;
+  return best;
+}
+
+let AC=null, MASTER=null, REVSEND=null, WAVES=null;
+const voices=new Map();                    /* note -> [voice] */
+const sustained=new Set();                 /* ペダルで残している音 */
+const NO_DAMPER=89;                        /* これ以上の音にはダンパーが無い */
+
+function makeIR(c,dur,decay){
+  const n=Math.floor(c.sampleRate*dur), b=c.createBuffer(2,n,c.sampleRate);
+  for(let ch=0;ch<2;ch++){
+    const d=b.getChannelData(ch);
+    for(let i=0;i<n;i++) d[i]=(Math.random()*2-1)*Math.pow(1-i/n,decay);
+  }
+  return b;
+}
+/* 倍音の群。n番目の倍音の大きさは n^-1.1 に、ハンマー位置によるへこみを掛ける */
+function makeWaves(c){
+  const amp=n=>Math.pow(n,-1.1)*Math.abs(Math.sin(n*Math.PI/8.2));
+  const mk=(from,to)=>{
+    const re=new Float32Array(to+1), im=new Float32Array(to+1);
+    for(let n=from;n<=to;n++) im[n]=amp(n);
+    return c.createPeriodicWave(re,im,{disableNormalization:true});
+  };
+  return [mk(1,4), mk(5,10), mk(11,20)];
+}
+function ac(){
+  if(AC) return AC;
+  AC=new (window.AudioContext||window.webkitAudioContext)();
+  /* 和音とペダルで音が積み重なると簡単に振り切れるので、最後に軽く抑える */
+  const comp=AC.createDynamicsCompressor();
+  comp.threshold.value=-14; comp.knee.value=12; comp.ratio.value=8;
+  comp.attack.value=0.003; comp.release.value=0.25;
+  comp.connect(AC.destination);
+  MASTER=AC.createGain(); MASTER.gain.value=0.85; MASTER.connect(comp);
+  const rev=AC.createConvolver(); rev.buffer=makeIR(AC,1.5,2.6);
+  REVSEND=AC.createGain(); REVSEND.gain.value=0.16;
+  REVSEND.connect(rev); rev.connect(MASTER);
+  WAVES=makeWaves(AC);
+  return AC;
+}
+function synthOn(note,vel,when){
+  const c=ac(), t=Math.max(when, c.currentTime);
+  const f=440*Math.pow(2,(note-69)/12), v=clamp(vel/127,0.02,1);
+  const T1=clamp(1.2+1400/f, 1.1, 8);      /* 低い音ほど長く残る */
+  const out=c.createGain(); out.gain.value=1;
+  const lp=c.createBiquadFilter();
+  lp.type='lowpass'; lp.Q.value=0.5;
+  out.connect(lp); lp.connect(MASTER); lp.connect(REVSEND);
+  const oscs=[];
+
+  /* 録音した音があればそれを鳴らす。強さは音量と明るさの両方で表す
+     （録音は1段階の強さしか無いので、弱い音はローパスで暗くする） */
+  if(PIANO.state==='ready'){
+    const base=nearestSample(note), src=c.createBufferSource(), g=c.createGain();
+    src.buffer=PIANO.bufs.get(base);
+    src.playbackRate.value=Math.pow(2,(note-base)/12);
+    lp.frequency.value=clamp(900*Math.pow(2,4.0*v), 900, 16000);
+    g.gain.setValueAtTime(0.0001,t);
+    g.gain.exponentialRampToValueAtTime(clamp(1.35*Math.pow(v,1.4),0.001,2), t+0.003);
+    src.connect(g); g.connect(out);
+    src.start(t);
+    oscs.push(src);
+    const dur=src.buffer.duration/src.playbackRate.value;
+    const voice={out,oscs,end:t+dur};
+    if(!voices.has(note)) voices.set(note,[]);
+    voices.get(note).push(voice);
+    if(voices.size>140) for(const [n,l] of voices) if(l.every(x=>x.end<c.currentTime)) voices.delete(n);
+    return voice;
+  }
+  lp.frequency.value=clamp(f*(12+12*v), 1600, 15000);   /* 強く弾くほど明るい */
+
+  const group=(wave,gain,dec,detune)=>{
+    if(gain<0.0004) return;
+    const o=c.createOscillator(), g=c.createGain();
+    o.setPeriodicWave(wave); o.frequency.value=f; if(detune) o.detune.value=detune;
+    g.gain.setValueAtTime(0.0001,t);
+    g.gain.exponentialRampToValueAtTime(gain, t+0.004);
+    if(dec>2){                              /* 低め・長めの音は二段階で落とす */
+      g.gain.exponentialRampToValueAtTime(gain*0.30, t+0.45);
+      g.gain.exponentialRampToValueAtTime(0.00008, t+dec);
+    }else g.gain.exponentialRampToValueAtTime(0.00008, t+dec);
+    o.connect(g); g.connect(out);
+    o.start(t); o.stop(t+dec+0.1);
+    oscs.push(o);
+  };
+  /* 強く弾くほど上の倍音が増える（音量だけでなく音色が変わる） */
+  const A=0.10*Math.pow(v,1.15);
+  group(WAVES[0], A*0.58, T1,  -1.4);       /* 弦を2本に分けてうならせる */
+  group(WAVES[0], A*0.50, T1,  +1.4);   /* 2本の弦。少し量を変えて、うなりで消えきらないようにする */
+  group(WAVES[1], A*1.00*Math.pow(v,1.1), T1*0.36, 0);
+  group(WAVES[2], A*0.75*Math.pow(v,1.6), T1*0.22, 0);
+  /* 打鍵の雑音 */
+  const nb=c.createBuffer(1,Math.ceil(c.sampleRate*0.03),c.sampleRate), nd=nb.getChannelData(0);
+  for(let i=0;i<nd.length;i++) nd[i]=(Math.random()*2-1)*Math.pow(1-i/nd.length,3);
+  const ns=c.createBufferSource(), nf=c.createBiquadFilter(), ng=c.createGain();
+  ns.buffer=nb; nf.type='bandpass'; nf.frequency.value=clamp(f*5,600,6000); nf.Q.value=0.8;
+  ng.gain.value=0.035*Math.pow(v,2.2);
+  ns.connect(nf).connect(ng).connect(out); ns.start(t);
+
+  const voice={out,oscs,end:t+T1+0.2};
+  if(!voices.has(note)) voices.set(note,[]);
+  voices.get(note).push(voice);
+  /* 古い音が溜まりすぎないよう、終わったものは捨てる */
+  if(voices.size>140) for(const [n,l] of voices) if(l.every(x=>x.end<c.currentTime)) voices.delete(n);
+  return voice;
+}
+function synthOff(note,when){
+  if(note>=NO_DAMPER) return;               /* ダンパーが無い音域は止まらない */
+  const c=ac(), t=Math.max(when, c.currentTime), list=voices.get(note);
+  if(!list) return;
+  const f=440*Math.pow(2,(note-69)/12);
+  const rel=clamp(0.07+30/f, 0.07, 0.32);   /* 低音のダンパーはゆっくり効く */
+  for(const v of list){
+    try{
+      v.out.gain.cancelScheduledValues(t);
+      v.out.gain.setValueAtTime(v.out.gain.value,t);
+      v.out.gain.exponentialRampToValueAtTime(0.0001, t+rel);
+    }catch(e){}
+    for(const o of v.oscs){ try{ o.stop(t+rel+0.05); }catch(e){} }
+  }
+  voices.delete(note);
+}
+function synthAllOff(){
+  const t=AC?AC.currentTime:0;
+  for(const [n,list] of voices){
+    for(const v of list){
+      try{ v.out.gain.cancelScheduledValues(t); v.out.gain.setValueAtTime(v.out.gain.value,t);
+           v.out.gain.exponentialRampToValueAtTime(0.0001,t+0.08); }catch(e){}
+      for(const o of v.oscs){ try{ o.stop(t+0.12); }catch(e){} }
+    }
+  }
+  voices.clear(); sustained.clear();
+}
+
+/* ---- 出力先 ---- */
+function refreshOutputs(){
+  const sel=$('outSel'), prev=sel.value;
+  const opts=['<option value="">内蔵音（ピアノ音源）</option>'];
+  if(midi) for(const o of midi.outputs.values()) opts.push(`<option value="${o.id}">${o.name} に送る</option>`);
+  sel.innerHTML=opts.join('');
+  /* ピアノがつながっていれば、初期値はピアノ側にする */
+  if(prev && [...sel.options].some(o=>o.value===prev)) sel.value=prev;
+  else if(sel.options.length>1) sel.selectedIndex=1;
+}
+const outputPort = () => {
+  const id=$('outSel').value;
+  if(!id||!midi) return null;
+  for(const o of midi.outputs.values()) if(o.id===id) return o;
+  return null;
+};
+
+/* ---- 送信 ---- */
+function pbSend(e, when){
+  if(PB.out){
+    if(e.k==='on'){ PB.out.send([0x90,e.a,e.b],when); PB.onNotes.add(e.a); }
+    else if(e.k==='off'){ PB.out.send([0x80,e.a,0x40],when); PB.onNotes.delete(e.a); }
+    else PB.out.send([0xB0,e.a,e.b],when);
+    return;
+  }
+  /* 内蔵音。ペダルを踏んでいる間の離鍵は消さず、離した時点でまとめて消す */
+  const c=ac(), at=c.currentTime+(when-performance.now())/1000;
+  if(e.k==='on'){ synthOn(e.a,e.b,at); sustained.delete(e.a); }
+  else if(e.k==='off'){ if(PB.damper>=64) sustained.add(e.a); else synthOff(e.a,at); }
+  else if(e.k==='cc' && e.a===64 && e.b<64){
+    for(const n of sustained) synthOff(n,at);
+    sustained.clear();
+  }
+}
+function pbTickSend(){
+  const take=curTake(); if(!take||!PB.playing) return;
+  const ev=take.events, horizon=pbElapsed()+LOOKAHEAD;
+  while(PB.sendIdx<ev.length && ev[PB.sendIdx].t<=horizon){
+    const e=ev[PB.sendIdx++];
+    const when=PB.startAt+(e.t-PB.offset);
+    if(e.k==='cc'&&e.a===64) { pbSend(e,when); PB.damper=e.b; }
+    else pbSend(e,when);
+  }
+}
+/* 画面をいまの再生位置まで進める。何度呼んでも同じところで止まる */
+function pbAdvance(){
+  if(!PB.playing) return;
+  const take=curTake(); if(!take){ stopPlay(); return; }
+  const ev=take.events, now=pbElapsed();
+  while(PB.dispIdx<ev.length && ev[PB.dispIdx].t<=now){
+    const e=ev[PB.dispIdx++];
+    if(e.k==='on') noteOn(e.a,e.b);
+    else if(e.k==='off') noteOff(e.a);
+    else controlPedal(e.a,e.b);
+  }
+  PB.pos=now;
+  $("playStat").textContent=`再生中 ${fmtTime(now)} / ${fmtTime(take.dur)}`;
+  $("playStat").className="stat ok";
+  if(now>=take.dur+200) stopPlay();
+}
+/* なめらかさは rAF に任せるが、裏のタブなどで rAF が止まっても
+   終わりを見落とさないよう、送信のタイマー側でも同じ処理を回す */
+function pbTickDisplay(){
+  if(!PB.playing) return;
+  pbAdvance();
+  if(PB.playing) PB.raf=requestAnimationFrame(pbTickDisplay);
+}
+async function startPlay(from){
+  const take=curTake(); if(!take||S.recording) return;
+  stopPlay(true);
+  PB.out=outputPort();
+  if(!PB.out){
+    try{ ac().resume(); }catch(e){}
+    /* 初回だけ、録音されたピアノの音を取りに行く */
+    if(PIANO.state==='none'){
+      $('btnPlay').disabled=true;
+      await loadPiano((d,n)=>{ $('playStat').textContent=`ピアノ音源を読み込み中… ${d}/${n}`; $('playStat').className='stat'; });
+      $('btnPlay').disabled=false;
+      $('playStat').textContent = PIANO.state==='ready' ? '' : '音源を取得できなかったので合成音で鳴らします';
+    }
+  }
+  panic();
+  PB.playing=true;
+  PB.offset=clamp(from||0, 0, Math.max(0,take.dur-50));
+  PB.startAt=performance.now();
+  PB.damper=0; PB.onNotes.clear();
+  /* 途中から鳴らすときは、そこまでのペダルの状態を先に作っておく */
+  const ev=take.events;
+  let i=0; while(i<ev.length && ev[i].t<PB.offset) i++;
+  PB.sendIdx=i; PB.dispIdx=i;
+  for(let j=0;j<i;j++) if(ev[j].k==='cc'&&ev[j].a===64) PB.damper=ev[j].b;
+  if(PB.damper>0) pbSend({k:'cc',a:64,b:PB.damper}, performance.now());
+  $('btnPlay').textContent='■ 停止';
+  $('btnRec').disabled=true;
+  pbTickSend();
+  PB.timer=setInterval(()=>{ pbTickSend(); pbAdvance(); },60);
+  PB.raf=requestAnimationFrame(pbTickDisplay);
+}
+function stopPlay(quiet){
+  if(PB.timer) clearInterval(PB.timer);
+  if(PB.raf) cancelAnimationFrame(PB.raf);
+  PB.timer=PB.raf=null;
+  const was=PB.playing;
+  PB.playing=false;
+  if(PB.out){
+    /* 先に送ってある予定を取り消し、鳴りっぱなしを確実に止める。
+       CC123 を無視する機種があるので、88鍵ぶんのノートオフも送る */
+    try{ PB.out.clear&&PB.out.clear(); }catch(e){}
+    try{
+      PB.out.send([0xB0,64,0]); PB.out.send([0xB0,66,0]);
+      for(let n=KB_LO;n<=KB_HI;n++) PB.out.send([0x80,n,0x40]);
+      PB.out.send([0xB0,123,0]);
+    }catch(e){}
+  }
+  PB.onNotes.clear();
+  synthAllOff();
+  PB.out=null;
+  if(was) panic();
+  $('btnPlay').textContent='▶ 再生';
+  $('btnRec').disabled=false;
+  if(was&&!quiet){ $("playStat").textContent=""; }
+}
+
+
+const TPQ=480, USQ=500000;                     /* ♩=120 として、1tick ≒ 1.0417ms */
+const ms2tick = ms => Math.round(ms*TPQ*1000/USQ);
+function varLen(v){ const b=[v&0x7f]; v=Math.floor(v/128); while(v>0){ b.unshift((v&0x7f)|0x80); v=Math.floor(v/128); } return b; }
+/* このアプリの format 0 書き出しを読み戻す。音符と CC64/66/67 のみ扱う。 */
+function fromSMF(buf,name){
+  const d=new DataView(buf); let p=0;
+  const fail=()=>{ throw new Error('このアプリで保存した.midファイルを選んでください'); };
+  const need=n=>{ if(p+n>d.byteLength) fail(); };
+  const u8=()=>{ need(1); return d.getUint8(p++); };
+  const u16=()=>{ need(2); const n=d.getUint16(p); p+=2; return n; };
+  const u32=()=>{ need(4); const n=d.getUint32(p); p+=4; return n; };
+  const tag=()=>String.fromCharCode(u8(),u8(),u8(),u8());
+  const vlq=()=>{ let n=0; for(let i=0;i<4;i++){ const b=u8(); n=n*128+(b&127); if(!(b&128)) return n; } fail(); };
+  if(tag()!=='MThd'||u32()!==6||u16()!==0||u16()!==1||u16()!==TPQ) fail();
+  if(tag()!=='MTrk') fail();
+  const trackLen=u32(), end=p+trackLen; if(end>d.byteLength) fail();
+  const events=[]; let tick=0, status=0, tempo=false, ended=false;
+  while(p<end){
+    tick+=vlq(); if(!Number.isSafeInteger(tick)) fail();
+    let st=u8();
+    if(st<0x80){ if(!status) fail(); p--; st=status; }
+    else if(st<0xF0) status=st;
+    else status=0;
+    if(st===0xFF){
+      const type=u8(), len=vlq(); need(len);
+      if(type===0x51){ if(len!==3||tempo||((u8()<<16)|(u8()<<8)|u8())!==USQ) fail(); tempo=true; }
+      else if(type===0x2F){ if(len!==0||p!==end) fail(); ended=true; break; }
+      else fail();
+      continue;
+    }
+    if((st&15)!==0) fail();
+    const kind=st&0xF0, a=u8(), b=u8(); if(a>127||b>127) fail();
+    const t=Math.round(tick*USQ/(TPQ*1000));
+    if(kind===0x90) events.push({t,k:b?'on':'off',a,b:b||0});
+    else if(kind===0x80) events.push({t,k:'off',a,b:0});
+    else if(kind===0xB0 && [64,66,67].includes(a)) events.push({t,k:'cc',a,b});
+    else fail();
+    if(events.length>500000) fail();
+  }
+  if(!tempo||!ended||!events.length) fail();
+  const at=Date.now();
+  return {id:'t'+at+'-'+Math.random().toString(36).slice(2,8),at,name,dur:Math.round(tick*USQ/(TPQ*1000)),events};
+}
+function toSMF(take){
+  const tr=[];
+  tr.push(0x00,0xFF,0x51,0x03,(USQ>>16)&0xff,(USQ>>8)&0xff,USQ&0xff);
+  let prev=0;
+  for(const e of take.events){
+    const tk=ms2tick(e.t);
+    tr.push(...varLen(tk-prev)); prev=tk;
+    if(e.k==='on') tr.push(0x90,e.a&0x7f,e.b&0x7f);
+    else if(e.k==='off') tr.push(0x80,e.a&0x7f,0x40);
+    else tr.push(0xB0,e.a&0x7f,e.b&0x7f);
+  }
+  tr.push(...varLen(Math.max(0,ms2tick(take.dur)-prev)),0xFF,0x2F,0x00);
+  const len=tr.length;
+  const bytes=[
+    0x4D,0x54,0x68,0x64, 0,0,0,6, 0,0, 0,1, (TPQ>>8)&0xff,TPQ&0xff,
+    0x4D,0x54,0x72,0x6B, (len>>24)&0xff,(len>>16)&0xff,(len>>8)&0xff,len&0xff,
+    ...tr,
+  ];
+  return new Uint8Array(bytes);
+}
+function download(name,blob){
+  const a=document.createElement('a'), url=URL.createObjectURL(blob);
+  a.href=url; a.download=name; document.body.appendChild(a); a.click();
+  setTimeout(()=>{ URL.revokeObjectURL(url); a.remove(); },0);
+}
+function datedMidName(){
+  const d=new Date(), p=n=>String(n).padStart(2,'0');
+  return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}_${p(d.getHours())}-${p(d.getMinutes())}-${p(d.getSeconds())}.mid`;
+}
+
 /* ===== 操作バー：つながったあと、マウスが止まっていれば隠す ===== */
 let hideT=null;
 function armHide(){
@@ -437,6 +909,31 @@ function saveOpts(){
 })();
 
 $('btnConnect').addEventListener('click',()=>connectMidi(false));
+$('btnRec').addEventListener('click',()=>S.recording?stopRec():startRec());
+$('btnPlay').addEventListener('click',()=>PB.playing?stopPlay():startPlay(0));
+$('takeSel').addEventListener('change',e=>{ stopPlay(); S.curId=e.target.value; refreshTakes(); });
+$('outSel').addEventListener('change',()=>{
+  if(PB.playing){ stopPlay(); startPlay(0); }
+});
+$('btnMid').addEventListener('click',()=>{
+  const take=curTake(); if(take) download(datedMidName(),new Blob([toSMF(take)],{type:'audio/midi'}));
+});
+$('btnImport').addEventListener('click',()=>$('midFile').click());
+$('midFile').addEventListener('change',async e=>{
+  const file=e.target.files[0]; e.target.value=''; if(!file) return;
+  stopPlay();
+  try{
+    if(file.size>16*1024*1024) throw new Error('ファイルが大きすぎます（上限16MB）');
+    const take=fromSMF(await file.arrayBuffer(),file.name);
+    S.takes.unshift(take); S.curId=take.id;
+    saveTakes(); refreshTakes();
+    $('playStat').textContent=`${file.name} を読み込みました`;
+    $('playStat').className='stat ok';
+  }catch(err){
+    $('playStat').textContent=err.message;
+    $('playStat').className='stat ng';
+  }
+});
 $('optFlow').addEventListener('change',e=>{ S.flow=e.target.checked; saveOpts(); applyOpts(); });
 $('flowSpd').addEventListener('input',e=>{
   S.flowSec=(+e.target.value)/10;
@@ -448,7 +945,11 @@ $('optPed').addEventListener('change',e=>{ S.showPed=e.target.checked; saveOpts(
 $('optClear').addEventListener('change',e=>{ S.clear=e.target.checked; saveOpts(); applyOpts(); });
 addEventListener('resize',()=>{ G=null; render(); });
 
-applyOpts();
+loadTakes(); refreshTakes(); refreshOutputs(); applyOpts();
+addEventListener('storage',e=>{
+  if(e.key!==LS_TAKES||S.recording) return;
+  stopPlay(); loadTakes(); refreshTakes();
+});
 if(!navigator.requestMIDIAccess){
   setStatus('このブラウザは Web MIDI API に非対応です','ng');
   $('btnConnect').disabled=true;
