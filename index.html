@@ -272,6 +272,8 @@
       <span id="playStat" class="stat"></span>
       <span style="flex:1 1 auto"></span>
       <button id="btnMid">.mid</button>
+      <button id="btnImport">.mid 読み込み</button>
+      <input id="midFile" type="file" accept=".mid,.midi,audio/midi" hidden>
       <button id="btnJson">.json</button>
       <button id="btnZoomOut" title="グラフの表示範囲を全体に戻す">全体</button>
       <button id="btnDel">削除</button>
@@ -1119,9 +1121,9 @@ function fmtTime(ms){
 }
 function refreshTakes(){
   const sel=$('takeSel');
-  sel.innerHTML = S.takes.length
-    ? S.takes.map(t=>`<option value="${t.id}"${t.id===S.curId?' selected':''}>${t.name}</option>`).join('')
-    : '<option value="">録音なし</option>';
+  sel.replaceChildren(...(S.takes.length
+    ? S.takes.map(t=>{ const o=new Option(t.name,t.id); o.selected=t.id===S.curId; return o; })
+    : [new Option('録音なし','')]));
   const none=!S.takes.length;
   for(const id of ['btnMid','btnJson','btnDel','btnZoomOut','btnPlay','btnRename']) $(id).disabled=none;
 }
@@ -1762,6 +1764,46 @@ function stopPlay(quiet){
 const TPQ=480, USQ=500000;                     /* ♩=120 として、1tick ≒ 1.0417ms */
 const ms2tick = ms => Math.round(ms*TPQ*1000/USQ);
 function varLen(v){ const b=[v&0x7f]; v=Math.floor(v/128); while(v>0){ b.unshift((v&0x7f)|0x80); v=Math.floor(v/128); } return b; }
+/* このアプリの format 0 書き出しを読み戻す。音符と CC64/66/67 のみ扱う。 */
+function fromSMF(buf,name){
+  const d=new DataView(buf); let p=0;
+  const fail=()=>{ throw new Error('このアプリで保存した.midファイルを選んでください'); };
+  const need=n=>{ if(p+n>d.byteLength) fail(); };
+  const u8=()=>{ need(1); return d.getUint8(p++); };
+  const u16=()=>{ need(2); const n=d.getUint16(p); p+=2; return n; };
+  const u32=()=>{ need(4); const n=d.getUint32(p); p+=4; return n; };
+  const tag=()=>String.fromCharCode(u8(),u8(),u8(),u8());
+  const vlq=()=>{ let n=0; for(let i=0;i<4;i++){ const b=u8(); n=n*128+(b&127); if(!(b&128)) return n; } fail(); };
+  if(tag()!=='MThd'||u32()!==6||u16()!==0||u16()!==1||u16()!==TPQ) fail();
+  if(tag()!=='MTrk') fail();
+  const trackLen=u32(), end=p+trackLen; if(end>d.byteLength) fail();
+  const events=[]; let tick=0, status=0, tempo=false, ended=false;
+  while(p<end){
+    tick+=vlq(); if(!Number.isSafeInteger(tick)) fail();
+    let st=u8();
+    if(st<0x80){ if(!status) fail(); p--; st=status; }
+    else if(st<0xF0) status=st;
+    else status=0;
+    if(st===0xFF){
+      const type=u8(), len=vlq(); need(len);
+      if(type===0x51){ if(len!==3||tempo||((u8()<<16)|(u8()<<8)|u8())!==USQ) fail(); tempo=true; }
+      else if(type===0x2F){ if(len!==0||p!==end) fail(); ended=true; break; }
+      else fail();
+      continue;
+    }
+    if((st&15)!==0) fail();
+    const kind=st&0xF0, a=u8(), b=u8(); if(a>127||b>127) fail();
+    const t=Math.round(tick*USQ/(TPQ*1000));
+    if(kind===0x90) events.push({t,k:b?'on':'off',a,b:b||0});
+    else if(kind===0x80) events.push({t,k:'off',a,b:0});
+    else if(kind===0xB0 && [64,66,67].includes(a)) events.push({t,k:'cc',a,b});
+    else fail();
+    if(events.length>500000) fail();
+  }
+  if(!tempo||!ended||!events.length) fail();
+  const at=Date.now();
+  return {id:'t'+at+'-'+Math.random().toString(36).slice(2,8),at,name,dur:Math.round(tick*USQ/(TPQ*1000)),events};
+}
 function toSMF(take){
   const tr=[];
   tr.push(0x00,0xFF,0x51,0x03,(USQ>>16)&0xff,(USQ>>8)&0xff,USQ&0xff);
@@ -1773,7 +1815,7 @@ function toSMF(take){
     else if(e.k==='off') tr.push(0x80,e.a&0x7f,0x40);
     else tr.push(0xB0,e.a&0x7f,e.b&0x7f);
   }
-  tr.push(0x00,0xFF,0x2F,0x00);
+  tr.push(...varLen(Math.max(0,ms2tick(take.dur)-prev)),0xFF,0x2F,0x00);
   const len=tr.length;
   const bytes=[
     0x4D,0x54,0x68,0x64, 0,0,0,6, 0,0, 0,1, (TPQ>>8)&0xff,TPQ&0xff,
@@ -1786,6 +1828,10 @@ function download(name,blob){
   const a=document.createElement('a'), url=URL.createObjectURL(blob);
   a.href=url; a.download=name; document.body.appendChild(a); a.click();
   setTimeout(()=>{ URL.revokeObjectURL(url); a.remove(); },0);
+}
+function datedMidName(){
+  const d=new Date(), p=n=>String(n).padStart(2,'0');
+  return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}_${p(d.getHours())}-${p(d.getMinutes())}-${p(d.getSeconds())}.mid`;
 }
 /* 書き出すファイル名。名前は自由に付けられるので、使えない文字だけ落とす */
 function safeName(t){
@@ -1823,17 +1869,22 @@ function saveTakes(){
   try{ localStorage.removeItem(LS+'takes'); }catch(e){}
 }
 function loadTakes(){
+  const previous=S.curId;
   try{
     const a=JSON.parse(localStorage.getItem(LS+'takes')||'[]');
     if(Array.isArray(a)) S.takes=a.filter(t=>t&&Array.isArray(t.events));
   }catch(e){}
-  S.curId=S.takes.length?S.takes[0].id:null;
+  S.curId=S.takes.some(t=>t.id===previous)?previous:(S.takes[0]?.id||null);
 }
 
 /* =======================================================================
    配線
    ======================================================================= */
 loadOpts(); loadTakes();
+addEventListener('storage',e=>{
+  if(e.key!==LS+'takes'||S.recording) return;
+  stopPlay(); loadTakes(); refreshTakes(); renderTake();
+});
 
 $("optFlow").checked=S.flow;
 document.body.classList.toggle("flowon",S.flow);
@@ -1885,7 +1936,23 @@ $('outSel').addEventListener('change',()=>{
     loadPiano((d,n)=>{ $('playStat').textContent = d<n?`ピアノ音源を読み込み中… ${d}/${n}`:''; });
 });
 $('takeSel').addEventListener('change',e=>{ stopPlay(); S.curId=e.target.value; S.view=null; seekPos=0; renderTake(); });
-$('btnMid').addEventListener('click',()=>{ const t=curTake(); if(t) download(safeName(t)+'.mid',new Blob([toSMF(t)],{type:'audio/midi'})); });
+$('btnMid').addEventListener('click',()=>{ const t=curTake(); if(t) download(datedMidName(),new Blob([toSMF(t)],{type:'audio/midi'})); });
+$('btnImport').addEventListener('click',()=>$('midFile').click());
+$('midFile').addEventListener('change',async e=>{
+  const file=e.target.files[0]; e.target.value=''; if(!file) return;
+  stopPlay();
+  try{
+    if(file.size>16*1024*1024) throw new Error('ファイルが大きすぎます（上限16MB）');
+    const take=fromSMF(await file.arrayBuffer(),file.name);
+    S.takes.unshift(take); S.curId=take.id; S.view=null; seekPos=0;
+    saveTakes(); refreshTakes(); renderTake();
+    $('playStat').textContent=`${file.name} を読み込みました`;
+    $('playStat').className='stat ok';
+  }catch(err){
+    $('playStat').textContent=err.message;
+    $('playStat').className='stat ng';
+  }
+});
 $('btnJson').addEventListener('click',()=>{ const t=curTake(); if(!t) return;
   download(safeName(t)+'.json',new Blob([JSON.stringify({name:t.name,dur:t.dur,events:t.events},null,1)],{type:'application/json'})); });
 $('btnZoomOut').addEventListener('click',()=>{ S.view=null; if(CHARTS.length) drawCharts(); });
