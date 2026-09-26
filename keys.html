@@ -71,13 +71,18 @@
   }
   #kb{display:block;width:100%;flex:1 1 auto;min-height:0;touch-action:none}
   /* 流れる表示。鍵盤の真上の余っている場所を全部使う */
-  #flow{display:none;width:100%;flex:1 1 auto;min-height:60px}
+  #flow{display:none;width:100%;flex:1 1 auto;min-height:60px;touch-action:none}
+  body.playing #flow{cursor:grab}
   body.flowon #flow{display:block}
   body.flowon #kb{flex:0 1 auto;height:auto;max-height:62%}
   #spdWrap{display:none}
   body.flowon #spdWrap{display:inline-flex}
   #spdWrap input[type=range]{width:110px;accent-color:var(--accent)}
   #spdWrap b{color:var(--fg);font-variant-numeric:tabular-nums;min-width:2.2em;text-align:right}
+  #seekRow{display:flex;align-items:center;gap:8px;flex:0 0 100%;min-width:0;font-size:12px;color:var(--dim);font-variant-numeric:tabular-nums}
+  #seekRow span{min-width:3.8em;text-align:center}
+  #seek{flex:1;min-width:0;margin:0;accent-color:var(--accent);cursor:pointer;touch-action:none}
+  #seek:disabled{opacity:.4;cursor:default}
   #pedals{display:flex;flex-direction:column;gap:6px;flex:0 0 auto}
   body.noped #pedals{display:none}
   .pd{display:flex;align-items:center;gap:10px;font-size:12px;color:var(--dim)}
@@ -112,12 +117,13 @@
   <button id="btnImport">.mid 読み込み</button>
   <input id="midFile" type="file" accept=".mid,.midi,audio/midi" hidden>
   <span id="playStat" class="stat"></span>
+  <div id="seekRow"><span id="seekNow">0:00.0</span><input id="seek" type="range" min="0" max="1" value="0" step="1" aria-label="再生位置" disabled><span id="seekEnd">0:00.0</span></div>
   <span class="sp"></span>
   <span class="tip">配信ソフトに入れるときは <code>keys.html?clear=1&amp;bar=0</code> のように付けると、透明背景でこのバーごと消せます</span>
 </div>
 
 <div id="stage">
-  <canvas id="flow"></canvas>
+  <canvas id="flow" aria-label="再生中は上下にドラッグして再生位置を調整"></canvas>
   <svg id="kb" preserveAspectRatio="xMidYMax meet" aria-label="鍵盤"></svg>
   <div id="pedals"></div>
 </div>
@@ -276,9 +282,11 @@ const COL_ON='#5cc8ff', COL_PED='#ffcc66';
 const ribbons=[];                 /* {n,x,w,col,t0,t1} t1=null なら伸びている最中 */
 const live=new Map();             /* note -> いま伸ばしている帯 */
 let flowRaf=null, G=null;
+const playbackFlowCache=new WeakMap();
 
 /* 鳴っている音と帯を合わせる。ペダルに移ったら色が変わるので、そこで区切る */
 function syncRibbons(){
+  if(PB.playing||PB.scrubbing) return;
   if(!S.flow){ live.clear(); return; }
   const snd=sounding();
   for(const [n,r] of [...live]){
@@ -305,6 +313,46 @@ function endRibbon(n){
   if(r){ r.t1=performance.now(); live.delete(n); }
   return r;
 }
+/* 再生時は録音の時刻から帯を作る。これなら途中へ移動しても前後の音を描ける。 */
+function playbackRibbons(take){
+  if(playbackFlowCache.has(take)) return playbackFlowCache.get(take);
+  const result=[], active=new Map(), held=new Set(), pedHeld=new Set(), sost=new Set(), velocity=new Map();
+  let damper=0, sostenuto=0;
+  const close=(n,t)=>{ const r=active.get(n); if(r) r.t1=t; active.delete(n); };
+  const open=(n,v,col,t)=>{
+    const b=ribbonBox(n);
+    const r={n,...b,col,a:0.45+0.55*clamp(v/127,0,1),t0:t,t1:take.dur};
+    result.push(r); active.set(n,r);
+  };
+  const release=(n,t)=>{ close(n,t); pedHeld.delete(n); velocity.delete(n); };
+  for(const e of take.events){
+    const t=clamp(e.t,0,take.dur), n=e.a;
+    if(e.k==='on'){
+      close(n,t); held.add(n); pedHeld.delete(n);
+      velocity.set(n,Math.max(velocity.get(n)||0,e.b));
+      open(n,e.b,COL_ON,t);
+    }else if(e.k==='off'){
+      if(!held.has(n)) continue;
+      held.delete(n); close(n,t);
+      if(damper>=64||sost.has(n)){
+        pedHeld.add(n); open(n,velocity.get(n)||90,COL_PED,t);
+      }else velocity.delete(n);
+    }else if(e.k==='cc'&&n===64){
+      const was=damper; damper=e.b;
+      if(was>=64&&damper<64)
+        for(const key of [...pedHeld]) if(!sost.has(key)) release(key,t);
+    }else if(e.k==='cc'&&n===66){
+      const was=sostenuto; sostenuto=e.b;
+      if(was<64&&sostenuto>=64) for(const key of held) sost.add(key);
+      else if(was>=64&&sostenuto<64){
+        sost.clear();
+        if(damper<64) for(const key of [...pedHeld]) release(key,t);
+      }
+    }
+  }
+  playbackFlowCache.set(take,result);
+  return result;
+}
 /* 画面上のどこに鍵盤の x があるか。SVG は余白を作って収まるので、その分をずらす */
 function syncFlow(){
   const el=$('kb'), cv=$('flow');
@@ -324,12 +372,16 @@ function drawFlow(){
   const dpr=cv.width/(G.w||1);
   ctx.setTransform(dpr,0,0,dpr,0,0);
   ctx.clearRect(0,0,G.w,G.h);
-  const now=performance.now(), H=G.h, px=H/(S.flowSec*1000);   /* 1ミリ秒あたりの上り幅 */
-  for(let i=ribbons.length-1;i>=0;i--){
-    const r=ribbons[i];
+  const playing=PB.playing||PB.scrubbing, take=playing?curTake():null;
+  const now=take?(PB.scrubbing?PB.pos:Math.min(pbElapsed(),take.dur)):performance.now();
+  const source=take?playbackRibbons(take):ribbons;
+  const H=G.h, px=H/(S.flowSec*1000);   /* 1ミリ秒あたりの上り幅 */
+  for(let i=source.length-1;i>=0;i--){
+    const r=source[i];
     const yTop=H-(now-r.t0)*px;
     const yBot=H-(now-(r.t1===null?now:r.t1))*px;
-    if(yBot<-4){ ribbons.splice(i,1); continue; }
+    if(yBot<-4){ if(!take) ribbons.splice(i,1); continue; }
+    if(yTop>H) continue;
     const x=G.ox+r.x*G.s, w=Math.max(2,r.w*G.s);
     const y=Math.max(yTop,-8), hh=Math.min(yBot,H)-y;
     if(hh<=0) continue;
@@ -381,21 +433,22 @@ function drawKeyboard(){
       if(lab) s+=`<text x="15" y="${y.toFixed(1)}" text-anchor="end" dominant-baseline="central" `
         +`font-size="10" fill="var(--dim2)">${lab}</text>`;
     }
-    let vmax=0, lastX=-1e9;
+    let vmax=0, lastLabelEnd=-1e9;
     for(const n of [...snd].sort((a,b)=>a-b)){
       const v=S.vel.get(n)||0;
       if(v>vmax) vmax=v;
       const held=S.held.has(n), cx=keyCX(n), w=isBlack(mod(n,12))?9.5:13, y=vy(v);
       s+=`<rect x="${(cx-w/2).toFixed(2)}" y="${y.toFixed(1)}" width="${w}" height="${(VEL_BASE-y).toFixed(1)}" `
         +`rx="1.5" fill="${held?'var(--on)':'var(--ped)'}"/>`;
-      if(cx-lastX>=24){
-        s+=`<text x="${cx.toFixed(2)}" y="${(y-3.5).toFixed(1)}" text-anchor="middle" font-size="10" `
+      const labelWidth=String(v).length*9;
+      if(cx-labelWidth/2-lastLabelEnd>=5){
+        s+=`<text x="${cx.toFixed(2)}" y="${(y-4).toFixed(1)}" text-anchor="middle" font-size="15" `
           +`fill="${held?'var(--on)':'var(--ped)'}">${v}</text>`;
-        lastX=cx;
+        lastLabelEnd=cx+labelWidth/2;
       }
     }
-    s+=`<text x="1193" y="${(VEL_TOP-12).toFixed(1)}" text-anchor="end" font-size="11" fill="var(--dim)">`
-      +`ベロシティ${vmax?`　いま最大 <tspan fill="var(--fg)" font-weight="600">${vmax}</tspan>`:''}</text>`;
+    s+=`<text x="1193" y="${(VEL_TOP-3).toFixed(1)}" text-anchor="end" font-size="16.5" `
+      +`fill="var(--fg)" font-weight="600">${vmax}</text>`;
   }
   for(const n of WHITES){
     const x=whiteX(n), f=fillOf(n);
@@ -457,6 +510,7 @@ function rec(e){
 function startRec(){
   if(PB.playing) stopPlay();
   S.recording=true; S.recT0=performance.now(); S.events=[];
+  refreshSeek();
   for(const [n,v] of S.held) S.events.push({t:0,k:'on',a:n,b:v});
   for(const cc of [64,66,67]) if(S.cc[cc]>0) S.events.push({t:0,k:'cc',a:cc,b:S.cc[cc]});
   $('btnRec').textContent='■ 停止'; $('btnRec').classList.remove('rec');
@@ -470,6 +524,7 @@ function tickRec(){
 }
 function stopRec(){
   S.recording=false; clearTimeout(recTimer);
+  refreshSeek();
   $('btnRec').textContent='● 録音開始'; $('btnRec').classList.add('rec');
   const ev=S.events, dur=Math.round(performance.now()-S.recT0), open=new Set();
   for(const e of ev){ if(e.k==='on') open.add(e.a); else if(e.k==='off') open.delete(e.a); }
@@ -504,6 +559,7 @@ function refreshTakes(){
     ? S.takes.map(t=>{ const o=new Option(t.name,t.id); o.selected=t.id===S.curId; return o; })
     : [new Option('録音なし','')]));
   $('btnPlay').disabled=$('btnMid').disabled=$('btnDel').disabled=!curTake();
+  refreshSeek();
 }
 
 const LOOKAHEAD=250;                       /* ms。これだけ先まで送っておく */
@@ -512,9 +568,48 @@ const PB={
   sendIdx:0, dispIdx:0, damper:0,
   timer:null, raf:null, out:null,          /* out=null なら内蔵音 */
   onNotes:new Set(),                       /* 消し忘れ防止に、鳴らした音を控える */
-  pos:0,
+  pos:0, scrubbing:false, request:0,
 };
 const pbElapsed = () => PB.offset + (performance.now()-PB.startAt);
+function refreshSeek(){
+  const take=curTake(), seek=$('seek'), dur=take?.dur||0;
+  const pos=take?clamp(PB.pos,0,dur):0;
+  seek.max=String(Math.max(1,dur));
+  seek.value=String(Math.round(pos));
+  seek.disabled=!take||S.recording;
+  seek.setAttribute('aria-valuetext',`${fmtTime(pos)} / ${fmtTime(dur)}`);
+  $('seekNow').textContent=fmtTime(pos);
+  $('seekEnd').textContent=fmtTime(dur);
+}
+/* 途中から再生するときに、直前までの鍵とペダルの状態を戻す。 */
+function playbackState(take,position){
+  const held=new Map(), vel=new Map(), pedHeld=new Set(), sost=new Set();
+  const cc={64:0,66:0,67:0}, seen={64:true,66:false,67:false};
+  const prune=()=>{ for(const n of vel.keys()) if(!held.has(n)&&!pedHeld.has(n)) vel.delete(n); };
+  for(const e of take.events){
+    if(e.t>=position) break;
+    const n=e.a;
+    if(e.k==='on'){
+      const prev=held.has(n)||pedHeld.has(n)?vel.get(n)||0:0;
+      held.set(n,e.b); pedHeld.delete(n); vel.set(n,Math.max(prev,e.b));
+    }else if(e.k==='off'){
+      if(!held.has(n)) continue;
+      held.delete(n);
+      if(cc[64]>=64||sost.has(n)) pedHeld.add(n);
+      prune();
+    }else if(e.k==='cc' && Object.hasOwn(cc,n)){
+      const prev=cc[n]; cc[n]=e.b; seen[n]=true;
+      if(n===64&&prev>=64&&e.b<64)
+        for(const key of [...pedHeld]) if(!sost.has(key)) pedHeld.delete(key);
+      if(n===66){
+        if(prev<64&&e.b>=64) for(const key of held.keys()) sost.add(key);
+        else if(prev>=64&&e.b<64){ sost.clear(); if(cc[64]<64) pedHeld.clear(); }
+      }
+      prune();
+    }
+  }
+  return {held,vel,pedHeld,sost,cc,seen};
+}
 
 /* ---- 内蔵音 ------------------------------------------------------------
    本命は「録音したピアノの音」を使うこと。Salamander Grand Piano
@@ -763,6 +858,7 @@ function pbAdvance(){
     else controlPedal(e.a,e.b);
   }
   PB.pos=now;
+  refreshSeek();
   $("playStat").textContent=`再生中 ${fmtTime(now)} / ${fmtTime(take.dur)}`;
   $("playStat").className="stat ok";
   if(now>=take.dur+200) stopPlay();
@@ -777,8 +873,10 @@ function pbTickDisplay(){
 async function startPlay(from){
   const take=curTake(); if(!take||S.recording) return;
   stopPlay(true);
-  PB.out=outputPort();
-  if(!PB.out){
+  const request=PB.request;
+  PB.pos=clamp(from??PB.pos,0,take.dur);
+  refreshSeek();
+  if(!outputPort()){
     try{ ac().resume(); }catch(e){}
     /* 初回だけ、録音されたピアノの音を取りに行く */
     if(PIANO.state==='none'){
@@ -788,29 +886,45 @@ async function startPlay(from){
       $('playStat').textContent = PIANO.state==='ready' ? '' : '音源を取得できなかったので合成音で鳴らします';
     }
   }
+  if(request!==PB.request||curTake()!==take) return;
+  PB.out=outputPort();
   panic();
+  ribbons.length=0;
   PB.playing=true;
-  PB.offset=clamp(from||0, 0, Math.max(0,take.dur-50));
+  document.body.classList.add('playing');
+  PB.offset=clamp(PB.pos, 0, Math.max(0,take.dur-50));
+  PB.pos=PB.offset;
   PB.startAt=performance.now();
   PB.damper=0; PB.onNotes.clear();
   /* 途中から鳴らすときは、そこまでのペダルの状態を先に作っておく */
   const ev=take.events;
   let i=0; while(i<ev.length && ev[i].t<PB.offset) i++;
   PB.sendIdx=i; PB.dispIdx=i;
-  for(let j=0;j<i;j++) if(ev[j].k==='cc'&&ev[j].a===64) PB.damper=ev[j].b;
-  if(PB.damper>0) pbSend({k:'cc',a:64,b:PB.damper}, performance.now());
+  const state=playbackState(take,PB.offset);
+  S.held=state.held; S.vel=state.vel; S.pedHeld=state.pedHeld; S.sost=state.sost; S.cc=state.cc;
+  for(const cc of [64,66,67]) if(state.seen[cc]) S.seenCC[cc]=true;
+  PB.damper=state.cc[64];
+  const when=performance.now();
+  for(const [n,v] of state.held) pbSend({k:'on',a:n,b:v},when);
+  for(const n of state.pedHeld) pbSend({k:'on',a:n,b:state.vel.get(n)||80},when);
+  for(const cc of [64,66,67]) if(state.cc[cc]>0) pbSend({k:'cc',a:cc,b:state.cc[cc]},when);
+  for(const n of state.pedHeld) pbSend({k:'off',a:n,b:0},when+1);
+  render();
   $('btnPlay').textContent='■ 停止';
   $('btnRec').disabled=true;
+  refreshSeek();
   pbTickSend();
   PB.timer=setInterval(()=>{ pbTickSend(); pbAdvance(); },60);
   PB.raf=requestAnimationFrame(pbTickDisplay);
 }
 function stopPlay(quiet){
+  PB.request++;
   if(PB.timer) clearInterval(PB.timer);
   if(PB.raf) cancelAnimationFrame(PB.raf);
   PB.timer=PB.raf=null;
   const was=PB.playing;
   PB.playing=false;
+  document.body.classList.remove('playing');
   if(PB.out){
     /* 先に送ってある予定を取り消し、鳴りっぱなしを確実に止める。
        CC123 を無視する機種があるので、88鍵ぶんのノートオフも送る */
@@ -825,9 +939,11 @@ function stopPlay(quiet){
   synthAllOff();
   PB.out=null;
   if(was) panic();
+  if(!quiet) PB.pos=0;
   $('btnPlay').textContent='▶ 再生';
   $('btnRec').disabled=false;
   if(was&&!quiet){ $("playStat").textContent=""; }
+  refreshSeek();
 }
 
 
@@ -955,7 +1071,66 @@ function saveOpts(){
 
 $('btnConnect').addEventListener('click',()=>connectMidi(false));
 $('btnRec').addEventListener('click',()=>S.recording?stopRec():startRec());
-$('btnPlay').addEventListener('click',()=>PB.playing?stopPlay():startPlay(0));
+$('btnPlay').addEventListener('click',()=>PB.playing?stopPlay():startPlay(PB.pos));
+$('seek').addEventListener('pointerdown',e=>{
+  if(!curTake()||S.recording) return;
+  e.currentTarget.setPointerCapture(e.pointerId);
+  const pos=PB.playing?clamp(pbElapsed(),0,curTake().dur):PB.pos;
+  barSeek.active=true; barSeek.resume=PB.playing;
+  if(PB.playing) stopPlay(true);
+  PB.pos=pos; PB.scrubbing=true;
+});
+$('seek').addEventListener('input',e=>{
+  PB.pos=+e.target.value;
+  refreshSeek();
+  if(!barSeek.active&&PB.playing) startPlay(PB.pos);
+});
+$('seek').addEventListener('pointerup',finishBarSeek);
+$('seek').addEventListener('pointercancel',finishBarSeek);
+const barSeek={active:false,resume:false};
+function finishBarSeek(){
+  if(!barSeek.active) return;
+  const resume=barSeek.resume;
+  barSeek.active=false; PB.scrubbing=false;
+  if(resume) startPlay(PB.pos);
+  else refreshSeek();
+}
+const flowGesture={active:false,id:null,startY:0,startPos:0,moved:false};
+$('flow').addEventListener('pointerdown',e=>{
+  const take=curTake();
+  if(!S.flow||!PB.playing||!take||S.recording) return;
+  e.preventDefault(); $('flow').setPointerCapture(e.pointerId);
+  flowGesture.active=true; flowGesture.id=e.pointerId;
+  flowGesture.startY=e.clientY;
+  flowGesture.startPos=clamp(pbElapsed(),0,take.dur);
+  flowGesture.moved=false;
+  stopPlay(true); PB.pos=flowGesture.startPos; PB.scrubbing=true; refreshSeek();
+});
+$('flow').addEventListener('pointermove',e=>{
+  if(!flowGesture.active||e.pointerId!==flowGesture.id) return;
+  const take=curTake(); if(!take) return;
+  const dy=e.clientY-flowGesture.startY;
+  if(Math.abs(dy)>4) flowGesture.moved=true;
+  if(flowGesture.moved){
+    PB.pos=clamp(flowGesture.startPos-dy/$('flow').getBoundingClientRect().height*S.flowSec*1000,0,take.dur);
+    refreshSeek();
+  }
+});
+$('flow').addEventListener('pointerup',e=>{
+  if(!flowGesture.active||e.pointerId!==flowGesture.id) return;
+  const take=curTake();
+  if(take&&!flowGesture.moved){
+    const rect=$('flow').getBoundingClientRect();
+    PB.pos=clamp(flowGesture.startPos-(rect.bottom-e.clientY)/rect.height*S.flowSec*1000,0,take.dur);
+  }
+  flowGesture.active=false; PB.scrubbing=false;
+  if(take) startPlay(PB.pos);
+});
+$('flow').addEventListener('pointercancel',e=>{
+  if(!flowGesture.active||e.pointerId!==flowGesture.id) return;
+  flowGesture.active=false; PB.scrubbing=false;
+  if(curTake()) startPlay(flowGesture.startPos);
+});
 $('takeSel').addEventListener('change',e=>{ stopPlay(); S.curId=e.target.value; refreshTakes(); });
 $('outSel').addEventListener('change',()=>{
   if(PB.playing){ stopPlay(); startPlay(0); }
