@@ -55,6 +55,15 @@
   .sp{flex:1 1 auto}
   .tip{font-size:11.5px;color:var(--dim2)}
   .tip code{background:var(--panel2);border-radius:4px;padding:1px 5px;color:var(--dim)}
+  .modal{position:fixed;inset:0;z-index:50;padding:18px;background:#0009;
+    display:flex;align-items:center;justify-content:center}
+  .modal[hidden]{display:none}
+  .mbox{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+    padding:16px;width:100%;max-width:400px;box-shadow:0 14px 44px #000a}
+  .mtitle{font-size:15px;font-weight:600;margin-bottom:6px}
+  .mbody{font-size:13px;color:var(--dim);margin-bottom:12px;overflow-wrap:anywhere}
+  .mrow{display:flex;gap:8px;justify-content:flex-end}
+  .mrow .danger{background:#b0353a;border-color:#c9464b;color:#fff;font-weight:600}
 
   #stage{
     flex:1 1 auto;min-height:0;display:flex;flex-direction:column;justify-content:flex-end;
@@ -74,6 +83,7 @@
   .pd{display:flex;align-items:center;gap:10px;font-size:12px;color:var(--dim)}
   .pd .nm{width:6.4em;flex:0 0 auto}
   .pd .bar{flex:1 1 auto;height:14px;background:#232733cc;border-radius:7px;position:relative;overflow:hidden}
+  .pd.damper .bar{height:45px}
   .pd .bar i{display:block;height:100%;background:var(--dim2);border-radius:7px;transition:width .05s linear}
   .pd .bar u{position:absolute;top:0;bottom:0;width:1px;background:var(--dim2);opacity:.75}
   .pd.down .bar i{background:var(--ped)}
@@ -98,6 +108,7 @@
   <button id="btnPlay">▶ 再生</button>
   <label class="fld">出力 <select id="outSel" aria-label="再生の出力先"></select></label>
   <button id="btnMid">.mid 保存</button>
+  <button id="btnDel">削除</button>
   <button id="btnImport">.mid 読み込み</button>
   <input id="midFile" type="file" accept=".mid,.midi,audio/midi" hidden>
   <span id="playStat" class="stat"></span>
@@ -111,6 +122,17 @@
   <div id="pedals"></div>
 </div>
 
+<div class="modal" id="modal" hidden>
+  <div class="mbox" role="dialog" aria-modal="true" aria-labelledby="mTitle">
+    <div class="mtitle" id="mTitle">この録音を削除しますか？</div>
+    <div class="mbody" id="mBody"></div>
+    <div class="mrow">
+      <button id="mCancel">やめる</button>
+      <button id="mOk" class="danger">削除する</button>
+    </div>
+  </div>
+</div>
+
 <script>
 "use strict";
 /* =======================================================================
@@ -121,6 +143,29 @@
 const $ = id => document.getElementById(id);
 const clamp = (v,a,b) => v<a?a:(v>b?b:v);
 const mod = (a,b) => ((a%b)+b)%b;
+function confirmDelete(name){
+  return new Promise(resolve=>{
+    const modal=$('modal'), cancel=$('mCancel'), ok=$('mOk');
+    $('mBody').textContent=`「${name}」　もとに戻せません。`;
+    modal.hidden=false;
+    const done=value=>{
+      modal.hidden=true;
+      cancel.removeEventListener('click',onCancel);
+      ok.removeEventListener('click',onOk);
+      modal.removeEventListener('click',onBack);
+      document.removeEventListener('keydown',onKey);
+      resolve(value);
+    };
+    const onCancel=()=>done(false), onOk=()=>done(true);
+    const onBack=e=>{ if(e.target===modal) onCancel(); };
+    const onKey=e=>{ if(e.key==='Escape') onCancel(); };
+    cancel.addEventListener('click',onCancel);
+    ok.addEventListener('click',onOk);
+    modal.addEventListener('click',onBack);
+    document.addEventListener('keydown',onKey);
+    cancel.focus();
+  });
+}
 
 const Q=new URLSearchParams(location.search);
 const qb=(k,d)=>Q.has(k)?!/^(0|false|no)$/i.test(Q.get(k)):d;
@@ -377,7 +422,7 @@ function drawPedals(){
   const rows=[[64,'ダンパー'],[66,'ソステヌート'],[67,'ソフト']].filter(([c])=>S.seenCC[c]);
   $('pedals').innerHTML = rows.map(([c,nm])=>{
     const v=S.cc[c], p=(v/127*100).toFixed(1), down=v>=64;
-    return `<div class="pd${down?' down':''}"><span class="nm">${nm}</span>`
+    return `<div class="pd${c===64?' damper':''}${down?' down':''}"><span class="nm">${nm}</span>`
          + `<span class="bar"><i style="width:${p}%"></i><u style="left:${(64/127*100).toFixed(1)}%"></u></span>`
          + `<span class="vv">${v}</span></div>`;
   }).join('');
@@ -458,7 +503,7 @@ function refreshTakes(){
   $('takeSel').replaceChildren(...(S.takes.length
     ? S.takes.map(t=>{ const o=new Option(t.name,t.id); o.selected=t.id===S.curId; return o; })
     : [new Option('録音なし','')]));
-  $('btnPlay').disabled=$('btnMid').disabled=!curTake();
+  $('btnPlay').disabled=$('btnMid').disabled=$('btnDel').disabled=!curTake();
 }
 
 const LOOKAHEAD=250;                       /* ms。これだけ先まで送っておく */
@@ -917,6 +962,15 @@ $('outSel').addEventListener('change',()=>{
 });
 $('btnMid').addEventListener('click',()=>{
   const take=curTake(); if(take) download(datedMidName(),new Blob([toSMF(take)],{type:'audio/midi'}));
+});
+$('btnDel').addEventListener('click',async ()=>{
+  const take=curTake(); if(!take||!await confirmDelete(take.name)) return;
+  stopPlay();
+  S.takes=S.takes.filter(t=>t.id!==take.id);
+  S.curId=S.takes[0]?.id||null;
+  saveTakes(); refreshTakes();
+  $('playStat').textContent='録音を削除しました';
+  $('playStat').className='stat';
 });
 $('btnImport').addEventListener('click',()=>$('midFile').click());
 $('midFile').addEventListener('change',async e=>{
